@@ -89,14 +89,20 @@ func NewJob(interval uint64) *Job {
 // True if the job should be run now
 func (j *Job) shouldRun() bool {
 	j.mu.Lock()
-	b := time.Now().After(j.nextRun)
-	j.mu.Unlock()
-	return b
+	defer j.mu.Unlock()
+	return time.Now().After(j.nextRun)
 }
 
 // Run the job and immediately reschedule it
 func (j *Job) run() ([]reflect.Value, error) {
 	j.mu.Lock()
+	// If the job has not been initialized yet, reschedule it slightly in the future
+	if j.jobFunc == "" {
+		j.nextRun = time.Now().Add(time.Second)
+		j.mu.Unlock()
+		return nil, nil
+	}
+
 	f := reflect.ValueOf(j.funcs[j.jobFunc])
 	params := j.fparams[j.jobFunc]
 	if len(params) != f.Type().NumIn() {
@@ -226,19 +232,16 @@ func (j *Job) roundToMidnight(t time.Time) time.Time {
 func (j *Job) scheduleNextRun() error {
 	now := time.Now()
 	j.mu.Lock()
+	defer j.mu.Unlock()
 	if j.lastRun == time.Unix(0, 0) {
 		j.lastRun = now
 	}
-	j.mu.Unlock()
 
 	switch j.unit {
 	case days:
-		j.mu.Lock()
 		j.nextRun = j.roundToMidnight(j.lastRun)
 		j.nextRun = j.nextRun.Add(j.atTime)
-		j.mu.Unlock()
 	case weeks:
-		j.mu.Lock()
 		j.nextRun = j.roundToMidnight(j.lastRun)
 		dayDiff := int(j.startDay)
 		dayDiff -= int(j.nextRun.Weekday())
@@ -246,11 +249,8 @@ func (j *Job) scheduleNextRun() error {
 			j.nextRun = j.nextRun.Add(time.Duration(dayDiff) * 24 * time.Hour)
 		}
 		j.nextRun = j.nextRun.Add(j.atTime)
-		j.mu.Unlock()
 	default:
-		j.mu.Lock()
 		j.nextRun = j.lastRun
-		j.mu.Unlock()
 	}
 
 	period, err := j.periodDuration()
@@ -259,21 +259,18 @@ func (j *Job) scheduleNextRun() error {
 	}
 
 	// advance to next possible schedule
-	j.mu.Lock()
 	for j.nextRun.Before(now) || j.nextRun.Before(j.lastRun) {
 		j.shouldDo = true
 		j.nextRun = j.nextRun.Add(period)
 	}
-	j.mu.Unlock()
 	return nil
 }
 
 // NextScheduledTime returns the time of when this job is to run next
 func (j *Job) NextScheduledTime() time.Time {
 	j.mu.Lock()
-	next := j.nextRun
-	j.mu.Unlock()
-	return next
+	defer j.mu.Unlock()
+	return j.nextRun
 }
 
 // the follow functions set the job's unit with seconds,minutes,hours...
@@ -287,8 +284,8 @@ func (j *Job) mustInterval(i uint64) error {
 // setUnit sets unit type
 func (j *Job) setUnit(unit string) *Job {
 	j.mu.Lock()
+	defer j.mu.Unlock()
 	j.unit = unit
-	j.mu.Unlock()
 	return j
 }
 
@@ -387,10 +384,9 @@ func (j *Job) Sunday() *Job {
 // Scheduler struct, the only data member is the list of jobs.
 // - implements the sort.Interface{} for sorting jobs, by the time nextRun
 type Scheduler struct {
-	err         error
-	shouldClear bool
-	mu          *sync.Mutex
-	jobs        []*Job // Slice store jobs
+	err  error
+	mu   *sync.Mutex
+	jobs []*Job // Slice store jobs
 }
 
 func (s *Scheduler) Len() int {
@@ -403,7 +399,7 @@ func (s *Scheduler) Swap(i, j int) {
 }
 
 func (s *Scheduler) Less(i, j int) bool {
-	l := s.jobs[j].nextRun.After(s.jobs[i].nextRun)
+	l := s.jobs[j].NextScheduledTime().After(s.jobs[i].NextScheduledTime())
 	return l
 }
 
@@ -413,18 +409,18 @@ func NewScheduler() *Scheduler {
 }
 
 // Get the current runnable jobs, which shouldRun is True
-func (s *Scheduler) getRunnableJobs() ([]*Job, int) {
+func (s *Scheduler) getRunnableJobs() []*Job {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var runnableJobs []*Job
 	sort.Sort(s)
-	for i := 0; i < len(s.jobs); i++ {
-		if !s.jobs[i].shouldRun() {
+	for _, j := range s.jobs {
+		if !j.shouldRun() {
 			break
 		}
-		runnableJobs = append(runnableJobs, s.jobs[i])
+		runnableJobs = append(runnableJobs, j)
 	}
-	return runnableJobs, len(runnableJobs)
+	return runnableJobs
 }
 
 // NextRun datetime when the next job should run.
@@ -435,7 +431,7 @@ func (s *Scheduler) NextRun() (*Job, time.Time) {
 		return nil, time.Now()
 	}
 	sort.Sort(s)
-	return s.jobs[0], s.jobs[0].nextRun
+	return s.jobs[0], s.jobs[0].NextScheduledTime()
 }
 
 // Every schedule a new periodic job with interval
@@ -443,8 +439,8 @@ func (s *Scheduler) Every(interval uint64, startImmediately bool) *Job {
 	job := NewJob(interval)
 	job.shouldDo = startImmediately
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.jobs = append(s.jobs, job)
-	s.mu.Unlock()
 	return job
 }
 
@@ -455,20 +451,9 @@ func (s *Scheduler) Err() error {
 
 // RunPending runs all the jobs that are scheduled to run.
 func (s *Scheduler) RunPending() error {
-	s.mu.Lock()
-	if s.shouldClear {
-		s.jobs = []*Job{}
-		s.shouldClear = false
-		s.mu.Unlock()
-		return nil
-	}
-	s.mu.Unlock()
-
-	runnableJobs, n := s.getRunnableJobs()
-	for i := 0; i < n; i++ {
-		s.mu.Lock()
-		_, err := runnableJobs[i].run()
-		s.mu.Unlock()
+	runnableJobs := s.getRunnableJobs()
+	for _, j := range runnableJobs {
+		_, err := j.run()
 
 		if err != nil {
 			return err
@@ -485,8 +470,13 @@ func (s *Scheduler) RunAll() {
 
 // RunAllwithDelay runs all jobs with delay seconds
 func (s *Scheduler) RunAllwithDelay(d int) {
-	for i := 0; i < len(s.jobs); i++ {
-		s.jobs[i].run()
+	// Make a copy because that is threadsafe
+	s.mu.Lock()
+	jobs := make([]*Job, len(s.jobs))
+	copy(jobs, s.jobs)
+	s.mu.Unlock()
+	for _, j := range jobs {
+		j.run()
 		if 0 != d {
 			time.Sleep(time.Duration(d))
 		}
@@ -494,25 +484,24 @@ func (s *Scheduler) RunAllwithDelay(d int) {
 }
 
 // Remove specific job j
-func (s *Scheduler) Remove(j interface{}) {
-	var nj []*Job
-	for i := 0; i < len(s.jobs); i++ {
-		if s.jobs[i].jobFunc == getFunctionName(j) {
-			continue
-		}
-		nj = append(nj, s.jobs[i])
-	}
-
+func (s *Scheduler) Remove(fn interface{}) {
 	s.mu.Lock()
-	s.jobs = nj
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	for i, j := range s.jobs {
+		if j.jobFunc == getFunctionName(fn) {
+			// Non-leaky delete from https://github.com/golang/go/wiki/SliceTricks
+			copy(s.jobs[i:], s.jobs[i+1:])  // shift the jobs down
+			s.jobs[len(s.jobs)-1] = nil     // zero out the remaining job
+			s.jobs = s.jobs[:len(s.jobs)-1] // drop the last job
+		}
+	}
 }
 
 // Clear delete all scheduled jobs
 func (s *Scheduler) Clear() {
 	s.mu.Lock()
-	s.shouldClear = true
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	s.jobs = nil
 }
 
 // Start all the pending jobs

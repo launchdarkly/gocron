@@ -394,22 +394,16 @@ type Scheduler struct {
 }
 
 func (s *Scheduler) Len() int {
-	s.mu.Lock()
 	l := len(s.jobs)
-	s.mu.Unlock()
 	return l
 }
 
 func (s *Scheduler) Swap(i, j int) {
-	s.mu.Lock()
 	s.jobs[i], s.jobs[j] = s.jobs[j], s.jobs[i]
-	s.mu.Unlock()
 }
 
 func (s *Scheduler) Less(i, j int) bool {
-	s.mu.Lock()
 	l := s.jobs[j].nextRun.After(s.jobs[i].nextRun)
-	s.mu.Unlock()
 	return l
 }
 
@@ -420,6 +414,8 @@ func NewScheduler() *Scheduler {
 
 // Get the current runnable jobs, which shouldRun is True
 func (s *Scheduler) getRunnableJobs() ([]*Job, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var runnableJobs []*Job
 	sort.Sort(s)
 	for i := 0; i < len(s.jobs); i++ {
@@ -433,6 +429,8 @@ func (s *Scheduler) getRunnableJobs() ([]*Job, int) {
 
 // NextRun datetime when the next job should run.
 func (s *Scheduler) NextRun() (*Job, time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if len(s.jobs) <= 0 {
 		return nil, time.Now()
 	}
@@ -457,13 +455,14 @@ func (s *Scheduler) Err() error {
 
 // RunPending runs all the jobs that are scheduled to run.
 func (s *Scheduler) RunPending() error {
+	s.mu.Lock()
 	if s.shouldClear {
-		s.mu.Lock()
 		s.jobs = []*Job{}
 		s.shouldClear = false
 		s.mu.Unlock()
 		return nil
 	}
+	s.mu.Unlock()
 
 	runnableJobs, n := s.getRunnableJobs()
 	for i := 0; i < n; i++ {

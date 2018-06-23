@@ -489,10 +489,8 @@ func (s *Scheduler) Remove(fn interface{}) {
 	defer s.mu.Unlock()
 	for i, j := range s.jobs {
 		if j.jobFunc == getFunctionName(fn) {
-			// Non-leaky delete from https://github.com/golang/go/wiki/SliceTricks
-			copy(s.jobs[i:], s.jobs[i+1:])  // shift the jobs down
-			s.jobs[len(s.jobs)-1] = nil     // zero out the remaining job
-			s.jobs = s.jobs[:len(s.jobs)-1] // drop the last job
+			s.jobs = append(s.jobs[:i], s.jobs[i+1:]...)
+			return
 		}
 	}
 }
